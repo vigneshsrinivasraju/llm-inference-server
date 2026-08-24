@@ -1,23 +1,34 @@
 """
-Phase 2: FastAPI server wrapping our LLM.
+Phase 2 + 3 (thread-safety fix): FastAPI server wrapping our LLM.
 
-Key idea: the model loads ONCE when the server starts (see the code
-outside any function, at the bottom under __main__ / at import time).
-Every request that comes in afterwards reuses that same loaded model.
-This is exactly how real inference servers work.
+IMPORTANT LESSON:
+llama-cpp-python's basic Llama object is NOT safe to call from multiple
+threads at once - doing so causes crashes/corruption, which is exactly
+what we saw when benchmarking at concurrency=5.
+
+Real inference engines (vLLM, TGI, Triton) solve this properly with
+continuous batching, letting many requests share GPU compute safely
+and efficiently at the same time.
+
+We don't have that here (CPU + llama.cpp), so instead we use a LOCK:
+a mechanism that forces only ONE request to actually run inference at
+a time, while others wait their turn in a queue. This keeps us safe
+and correct, and honestly demonstrates the real difference between
+naive serving and proper batched serving - which is worth discussing
+directly in your README.
 """
 
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from llama_cpp import Llama
 import time
+import json
+import threading
 
 # ---------------------------------------------------------
-# 1. Define what a request and response look like (schemas)
+# 1. Request/response schemas
 # ---------------------------------------------------------
-# Pydantic checks incoming JSON automatically. If someone sends
-# "max_tokens": "abc" instead of a number, FastAPI will reject it
-# before your code even runs. This is "input validation" for free.
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -44,33 +55,38 @@ llm = Llama(
 )
 print("Model loaded. Server ready.")
 
+# This lock ensures only one thread can run inference at a time.
+# Every request must "acquire" this lock before calling the model,
+# and releases it when done - forcing safe, one-at-a-time access.
+inference_lock = threading.Lock()
+
 
 # ---------------------------------------------------------
-# 3. Create the FastAPI app
+# 3. FastAPI app
 # ---------------------------------------------------------
 app = FastAPI(title="LLM Inference Server")
 
 
 @app.get("/")
 def health_check():
-    """Simple endpoint to confirm the server is alive."""
     return {"status": "ok", "message": "Inference server is running"}
 
 
 @app.post("/generate", response_model=GenerateResponse)
 def generate(request: GenerateRequest):
-    """
-    Takes a prompt, returns generated text + performance stats.
-    This reuses the SAME model instance loaded above — no reloading.
-    """
+    """Non-streaming: waits for the full response, then returns it."""
     start = time.time()
 
-    output = llm(
-        request.prompt,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
-        stop=["</s>"]
-    )
+    # Acquire the lock before touching the model. If another request
+    # is currently generating, this line will simply WAIT here until
+    # the lock is free - that's the "queueing" behavior in action.
+    with inference_lock:
+        output = llm(
+            request.prompt,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            stop=["</s>"]
+        )
 
     elapsed = time.time() - start
 
@@ -83,4 +99,46 @@ def generate(request: GenerateRequest):
         tokens_generated=tokens_generated,
         time_taken_sec=round(elapsed, 3),
         tokens_per_second=round(tokens_per_sec, 2)
+    )
+
+
+def token_generator(prompt: str, max_tokens: int, temperature: float):
+    """Generator for streaming - same lock protection applies here."""
+    start = time.time()
+    token_count = 0
+
+    with inference_lock:
+        stream = llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=["</s>"],
+            stream=True
+        )
+
+        for chunk in stream:
+            piece = chunk["choices"][0]["text"]
+            if piece:
+                token_count += 1
+                payload = json.dumps({"token": piece})
+                yield f"data: {payload}\n\n"
+
+    elapsed = time.time() - start
+    tokens_per_sec = token_count / elapsed if elapsed > 0 else 0
+
+    final_payload = json.dumps({
+        "done": True,
+        "tokens_generated": token_count,
+        "time_taken_sec": round(elapsed, 3),
+        "tokens_per_second": round(tokens_per_sec, 2)
+    })
+    yield f"data: {final_payload}\n\n"
+
+
+@app.post("/stream")
+def stream(request: GenerateRequest):
+    """Streaming endpoint: returns tokens one at a time as they're generated."""
+    return StreamingResponse(
+        token_generator(request.prompt, request.max_tokens, request.temperature),
+        media_type="text/event-stream"
     )
