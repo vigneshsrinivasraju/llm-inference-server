@@ -1,30 +1,27 @@
 """
-Phase 2 + 3 (thread-safety fix): FastAPI server wrapping our LLM.
+Deployment version: FastAPI server wrapping our LLM, now serving a
+simple web UI at "/" in addition to the existing API endpoints.
 
-IMPORTANT LESSON:
-llama-cpp-python's basic Llama object is NOT safe to call from multiple
-threads at once - doing so causes crashes/corruption, which is exactly
-what we saw when benchmarking at concurrency=5.
-
-Real inference engines (vLLM, TGI, Triton) solve this properly with
-continuous batching, letting many requests share GPU compute safely
-and efficiently at the same time.
-
-We don't have that here (CPU + llama.cpp), so instead we use a LOCK:
-a mechanism that forces only ONE request to actually run inference at
-a time, while others wait their turn in a queue. This keeps us safe
-and correct, and honestly demonstrates the real difference between
-naive serving and proper batched serving - which is worth discussing
-directly in your README.
+Designed to run on Hugging Face Spaces (free CPU tier):
+  - On startup, downloads the model automatically if it's not already
+    present (Spaces containers start fresh each build).
+  - Serves static/index.html at the root URL so visitors get a working
+    chat UI instead of a bare JSON health check.
 """
 
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from llama_cpp import Llama
 import time
 import json
 import threading
+import os
+import urllib.request
+
+MODEL_PATH = "models/tinyllama.gguf"
+MODEL_URL = "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 
 # ---------------------------------------------------------
 # 1. Request/response schemas
@@ -44,20 +41,24 @@ class GenerateResponse(BaseModel):
 
 
 # ---------------------------------------------------------
-# 2. Load the model ONCE, when the server starts
+# 2. Download the model if it's not already there, then load it
 # ---------------------------------------------------------
+os.makedirs("models", exist_ok=True)
+
+if not os.path.exists(MODEL_PATH):
+    print("Model not found locally - downloading (first startup only)...")
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    print("Model downloaded.")
+
 print("Loading model... please wait")
 llm = Llama(
-    model_path="models/tinyllama.gguf",
+    model_path=MODEL_PATH,
     n_ctx=2048,
     n_threads=4,
     verbose=False
 )
 print("Model loaded. Server ready.")
 
-# This lock ensures only one thread can run inference at a time.
-# Every request must "acquire" this lock before calling the model,
-# and releases it when done - forcing safe, one-at-a-time access.
 inference_lock = threading.Lock()
 
 
@@ -67,19 +68,21 @@ inference_lock = threading.Lock()
 app = FastAPI(title="LLM Inference Server")
 
 
-@app.get("/")
+@app.get("/health")
 def health_check():
     return {"status": "ok", "message": "Inference server is running"}
 
 
+@app.get("/")
+def serve_ui():
+    """Serves the chat UI at the root URL - this is what visitors see."""
+    return FileResponse("static/index.html")
+
+
 @app.post("/generate", response_model=GenerateResponse)
 def generate(request: GenerateRequest):
-    """Non-streaming: waits for the full response, then returns it."""
     start = time.time()
 
-    # Acquire the lock before touching the model. If another request
-    # is currently generating, this line will simply WAIT here until
-    # the lock is free - that's the "queueing" behavior in action.
     with inference_lock:
         output = llm(
             request.prompt,
@@ -103,7 +106,6 @@ def generate(request: GenerateRequest):
 
 
 def token_generator(prompt: str, max_tokens: int, temperature: float):
-    """Generator for streaming - same lock protection applies here."""
     start = time.time()
     token_count = 0
 
@@ -137,7 +139,6 @@ def token_generator(prompt: str, max_tokens: int, temperature: float):
 
 @app.post("/stream")
 def stream(request: GenerateRequest):
-    """Streaming endpoint: returns tokens one at a time as they're generated."""
     return StreamingResponse(
         token_generator(request.prompt, request.max_tokens, request.temperature),
         media_type="text/event-stream"
