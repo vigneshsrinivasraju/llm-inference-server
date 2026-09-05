@@ -149,7 +149,10 @@ async function sendPrompt() {
     const start = performance.now();
     const res = await fetch("/generate", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer demo-key-12345"
+      },
       body: JSON.stringify({ prompt: prompt, max_tokens: 150, temperature: 0.7 })
     });
     const data = await res.json();

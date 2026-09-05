@@ -1,19 +1,184 @@
-<!doctype html>
-<html>
-	<head>
-		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width" />
-		<title>My static Space</title>
-		<link rel="stylesheet" href="style.css" />
-	</head>
-	<body>
-		<div class="card">
-			<h1>Welcome to your static Space!</h1>
-			<p>You can modify this app directly by editing <i>index.html</i> in the Files and versions tab.</p>
-			<p>
-				Also don't forget to check the
-				<a href="https://huggingface.co/docs/hub/spaces" target="_blank">Spaces documentation</a>.
-			</p>
-		</div>
-	</body>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LLM Inference Server — Live Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f1117;
+    color: #e6e6e6;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+  }
+  header {
+    width: 100%;
+    max-width: 720px;
+    padding: 24px 16px 8px;
+    text-align: center;
+  }
+  header h1 {
+    font-size: 1.4rem;
+    margin: 0 0 4px;
+  }
+  header p {
+    color: #9aa0aa;
+    font-size: 0.85rem;
+    margin: 0;
+  }
+  #chat {
+    width: 100%;
+    max-width: 720px;
+    flex: 1;
+    padding: 16px;
+    overflow-y: auto;
+  }
+  .msg {
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin-bottom: 10px;
+    max-width: 85%;
+    line-height: 1.4;
+    font-size: 0.95rem;
+    white-space: pre-wrap;
+  }
+  .user {
+    background: #2563eb;
+    color: white;
+    margin-left: auto;
+  }
+  .bot {
+    background: #1e2130;
+    border: 1px solid #2a2e3d;
+  }
+  .stats {
+    font-size: 0.72rem;
+    color: #6b7280;
+    margin-top: 4px;
+  }
+  #inputBar {
+    width: 100%;
+    max-width: 720px;
+    display: flex;
+    gap: 8px;
+    padding: 12px 16px 24px;
+  }
+  #promptInput {
+    flex: 1;
+    background: #1e2130;
+    border: 1px solid #2a2e3d;
+    border-radius: 8px;
+    color: #e6e6e6;
+    padding: 12px 14px;
+    font-size: 0.95rem;
+    resize: none;
+  }
+  #sendBtn {
+    background: #2563eb;
+    border: none;
+    color: white;
+    padding: 0 20px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.95rem;
+  }
+  #sendBtn:disabled {
+    background: #374151;
+    cursor: not-allowed;
+  }
+  .footer-note {
+    color: #6b7280;
+    font-size: 0.75rem;
+    text-align: center;
+    padding-bottom: 16px;
+    max-width: 720px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>LLM Inference Server — Live Demo</h1>
+  <p>TinyLlama 1.1B running on CPU · streaming enabled · built by Vignesh Raju</p>
+</header>
+
+<div id="chat"></div>
+
+<div id="inputBar">
+  <textarea id="promptInput" rows="1" placeholder="Ask something..."></textarea>
+  <button id="sendBtn">Send</button>
+</div>
+
+<p class="footer-note">
+  This is a small (1.1B parameter) quantized model running on free CPU hosting — responses may be slower
+  and less accurate than larger models. Built to demonstrate a full inference-serving pipeline, not for
+  production use.
+</p>
+
+<script>
+const chat = document.getElementById("chat");
+const input = document.getElementById("promptInput");
+const sendBtn = document.getElementById("sendBtn");
+
+function addMessage(text, sender) {
+  const div = document.createElement("div");
+  div.className = "msg " + sender;
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+async function sendPrompt() {
+  const prompt = input.value.trim();
+  if (!prompt) return;
+
+  addMessage(prompt, "user");
+  input.value = "";
+  sendBtn.disabled = true;
+
+  const botDiv = addMessage("...", "bot");
+
+  try {
+    const start = performance.now();
+    const res = await fetch("/generate", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer demo-key-12345"
+      },
+      body: JSON.stringify({ prompt: prompt, max_tokens: 150, temperature: 0.7 })
+    });
+    const data = await res.json();
+    const elapsed = ((performance.now() - start) / 1000).toFixed(2);
+
+    botDiv.textContent = data.text || "(no response)";
+    const statsDiv = document.createElement("div");
+    statsDiv.className = "stats";
+    statsDiv.textContent = `${data.tokens_generated} tokens · ${data.tokens_per_second} tok/s · ${elapsed}s round trip`;
+    botDiv.appendChild(statsDiv);
+  } catch (err) {
+    botDiv.textContent = "Error: could not reach the server. It may still be loading — try again in a few seconds.";
+  } finally {
+    sendBtn.disabled = false;
+    chat.scrollTop = chat.scrollHeight;
+  }
+}
+
+sendBtn.addEventListener("click", sendPrompt);
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendPrompt();
+  }
+});
+</script>
+
+</body>
 </html>
